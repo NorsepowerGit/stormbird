@@ -25,7 +25,7 @@ use stormbird::wind::{
 
 use stormbird::controller::{
     Controller,
-    ControllerBuilder,
+    builder::ControllerBuilder,
     input::ControllerInput,
     output::ControllerOutput,
     measurements::FlowMeasurementSettings
@@ -338,13 +338,13 @@ impl StormbirdLiftingLine {
         &mut self,
         current_time: f64,
         time_step: f64,
-        controller_input: &ControllerInput
+        controller_input: &[ControllerInput]
     ) {
         if let Some(controller) = &self.controller {
             let controller_output = controller.update(
                 current_time,
                 time_step,
-                &controller_input
+                controller_input
             );
 
             if let Some(output) = &controller_output {
@@ -366,7 +366,7 @@ impl StormbirdLiftingLine {
         }
     }
 
-    fn set_model_control_values_from_controller_output(&mut self, controller_output: &ControllerOutput) {
+    fn set_model_control_values_from_controller_output(&mut self, controller_output: &[ControllerOutput]) {
         if let Some(model) = &mut self.stormbird_model {
             model.line_force_model.set_controller_output(controller_output)
         }
@@ -575,9 +575,10 @@ impl StormbirdLiftingLine {
         };
 
         let out = if let Some(env) = &self.wind_environment {
-            let apparent_wind_direction = env.apparent_wind_direction_from_condition_and_linear_velocity(
+            let apparent_wind_direction = env.apparent_wind_direction_from_condition_and_linear_velocity_and_height(
                 wind_condition,
-                linear_velocity
+                linear_velocity,
+                10.0
             );
 
             let mut freestream_velocity = env.apparent_wind_velocity_vectors_at_locations(
@@ -587,15 +588,14 @@ impl StormbirdLiftingLine {
             );
 
             if let Some(model) = &self.stormbird_model {
-                let non_dimensional_span_distances = &model.line_force_model.ctrl_point_spanwise_distance_non_dimensional;
-
+                let ctrl_points = &model.line_force_model.ctrl_points_global;
                 let wing_indices = model.line_force_model.wing_indices.clone();
 
                 env.apply_inflow_corrections(
                     apparent_wind_direction,
                     &mut freestream_velocity,
-                    non_dimensional_span_distances,
-                    wing_indices
+                    &ctrl_points,
+                    &wing_indices
                 );
             }
 
@@ -908,7 +908,7 @@ impl StormbirdLiftingLine {
         self.moment_sail_10_z = individual_moment_z_raw[9];
     }
 
-    fn controller_input(&self, result: &SimulationResult) -> ControllerInput {
+    fn controller_input(&self, result: &SimulationResult) -> Vec<ControllerInput> {
         match (&self.stormbird_model, &self.wind_environment, &self.controller) {
             (Some(model), Some(environment), Some(controller)) => {
                 return ControllerInput::new_from_simulation_result(
@@ -938,7 +938,7 @@ impl StormbirdLiftingLine {
 
     /// Takes a ControllerInput variable as input, an applies the data to the output variables in
     /// the FMU
-    fn set_controller_measurement_output(&mut self, controller_input: &ControllerInput) {
+    fn set_controller_measurement_output(&mut self, controller_input: &[ControllerInput]) {
         let output_size = 10;
 
         let mut angles_of_attack_extended = vec![0.0; output_size];
@@ -949,15 +949,15 @@ impl StormbirdLiftingLine {
         let nr_wings = self.nr_wings();
 
         for i in 0..nr_wings {
-            velocity_extended[i] = controller_input.velocity[i];
-            section_models_internal_state[i] = controller_input.current_section_models_internal_state[i];
+            velocity_extended[i] = controller_input[i].velocity;
+            section_models_internal_state[i] = controller_input[i].current_section_model_internal_state;
 
             if self.parameters.angles_in_degrees {
-                angles_of_attack_extended[i] = controller_input.angles_of_attack[i].to_degrees();
-                apparent_wind_directions_extended[i] = controller_input.apparent_wind_directions[i].to_degrees();
+                angles_of_attack_extended[i] = controller_input[i].angle_of_attack.to_degrees();
+                apparent_wind_directions_extended[i] = controller_input[i].apparent_wind_direction.to_degrees();
             } else {
-                angles_of_attack_extended[i] = controller_input.angles_of_attack[i];
-                apparent_wind_directions_extended[i] = controller_input.apparent_wind_directions[i];
+                angles_of_attack_extended[i] = controller_input[i].angle_of_attack;
+                apparent_wind_directions_extended[i] = controller_input[i].apparent_wind_direction;
             }
         }
 
