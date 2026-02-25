@@ -5,8 +5,8 @@
 
 pub use super::{
     Controller,
-    ControllerBuilder,
-    logic::ControllerLogic,
+    builder::ControllerBuilder,
+    set_points::ControllerSetPoints,
     input::ControllerInput,
     output::ControllerOutput,
     measurements::{
