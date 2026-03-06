@@ -1,7 +1,3 @@
-// Copyright (C) 2024, NTNU
-// Author: Norse Python Utils contributors
-// License: GPL v3.0
-
 //! Pure-Rust optimal RPM grid computation for rotor sails.
 //!
 //! `compute_optimal_rpm_grid` replaces the Python-level grid loop in
