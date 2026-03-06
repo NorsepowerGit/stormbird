@@ -14,6 +14,7 @@ mod line_force_model;
 mod lifting_line;
 mod smoothing;
 mod wind;
+mod optimal_rpm;
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -27,6 +28,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pymodule!(lifting_line::lifting_line))?;
     m.add_wrapped(wrap_pymodule!(smoothing::smoothing))?;
     m.add_wrapped(wrap_pymodule!(wind::wind))?;
+    m.add_wrapped(wrap_pymodule!(optimal_rpm::optimal_rpm))?;
     
     Ok(())
 }

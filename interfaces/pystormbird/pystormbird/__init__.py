@@ -9,6 +9,7 @@ sys.modules['pystormbird._native.section_models'] = _native.section_models
 sys.modules['pystormbird._native.line_force_model'] = _native.line_force_model
 sys.modules['pystormbird._native.wind'] = _native.wind
 sys.modules['pystormbird._native.smoothing'] = _native.smoothing
+sys.modules['pystormbird._native.optimal_rpm'] = _native.optimal_rpm
 
 # Re-export top-level classes
 from pystormbird._native import SimulationResult, SectionalForcesInput
@@ -19,6 +20,7 @@ from pystormbird import section_models
 from pystormbird import line_force_model
 from pystormbird import wind
 from pystormbird import smoothing
+from pystormbird import optimal_rpm
 
 __all__ = [
     "SimulationResult",
@@ -28,4 +30,5 @@ __all__ = [
     "line_force_model",
     "wind",
     "smoothing",
+    "optimal_rpm",
 ]

@@ -203,6 +203,109 @@ impl Simulation {
     }
 
 
+    // ─── two-phase optimal-RPM helpers ───────────────────────────────────────
+
+    /// **Phase 1** — call once per (AWA, AWS) condition.
+    ///
+    /// Updates the geometry and builds the N×N horseshoe-vortex influence matrix
+    /// (`frozen_wake.variable_velocity_factors`) for the given freestream velocity.
+    /// After this call the wake matrix is valid for *any* RPM combination at the same
+    /// freestream condition; callers should cache it by cloning the simulation and
+    /// reusing the clone for all RPM sweeps at that condition.
+    ///
+    /// Only supports `WakeData::QuasiSteady` + `Solver::Linearized` (the combination
+    /// used by the rotor-sail optimal-RPM calculation).  Calling this on a dynamic-wake
+    /// or `SimpleIterative` simulation is a no-op / will produce incorrect results.
+    ///
+    /// # Arguments
+    /// * `freestream_velocity` — velocity at each ctrl-point (length = `nr_span_lines`).
+    pub fn prepare_quasi_steady_wake(&mut self, freestream_velocity: &[SpatialVector]) {
+        // Update geometry once — this is O(N) and cheap, but must precede the wake
+        // build because the wake uses the current global ctrl/span-line geometry.
+        self.line_force_model.update_global_data_representations();
+
+        // Compute the *felt* velocities (subtracts rigid-body motion).
+        let felt_ctrl_points = self.line_force_model.felt_ctrl_points_velocity(freestream_velocity);
+
+        // Map ctrl-point velocities to span-point velocities (needed for wake direction).
+        let felt_span_points = self.line_force_model.span_point_values_from_ctrl_point_values(
+            &felt_ctrl_points,
+            false,
+        );
+
+        // Initialise on the very first call (sets `first_time_step_completed = true`).
+        if !self.first_time_step_completed {
+            self.initialize(freestream_velocity, 1.0);
+        }
+
+        // Build the N×N horseshoe-vortex influence matrix.  This is the expensive
+        // O(N²) operation that dominates `do_step`; we do it here once per condition.
+        if let WakeData::QuasiSteady(settings) = &self.wake_data {
+            self.frozen_wake.update_as_steady_from_line_force_model_and_velocities(
+                &self.line_force_model,
+                &felt_span_points,
+                settings,
+            );
+        }
+
+    }
+
+    /// **Phase 2** — call once per RPM combination after `prepare_quasi_steady_wake`.
+    ///
+    /// Sets the rotor RPMs on the section models, runs the Linearized solver using
+    /// the pre-built frozen-wake matrix, then computes and returns only the integrated
+    /// total force `[Fx, Fy, Fz]` per wing (in Newtons), without constructing the
+    /// full `SimulationResult`.
+    ///
+    /// Only valid after a call to `prepare_quasi_steady_wake` with the same freestream.
+    ///
+    /// # Arguments
+    /// * `rev_per_s` — revolutions per second for each wing/rotor (length = `nr_wings`).
+    /// * `freestream_velocity` — the *same* freestream passed to `prepare_quasi_steady_wake`.
+    ///
+    /// # Returns
+    /// `Vec<[f64; 3]>` of length `nr_wings`.  Each element is `[Fx, Fy, Fz]` in N.
+    pub fn solve_linearized_integrated_forces(
+        &mut self,
+        rev_per_s: &[Float],
+        freestream_velocity: &[SpatialVector],
+    ) -> Vec<[Float; 3]> {
+        // Set the rotor state (revolutions_per_second on RotatingCylinder sections).
+        self.line_force_model.set_section_models_internal_state(rev_per_s);
+
+        // Compute felt velocities for this freestream.
+        let felt_ctrl_pts = self.line_force_model.felt_ctrl_points_velocity(freestream_velocity);
+
+        // Run the Linearized solver with the pre-built frozen-wake matrix.
+        let solver_result = match &self.solver {
+            Solver::Linearized(solver) => solver.solve(
+                &self.line_force_model,
+                &felt_ctrl_pts,
+                &mut self.frozen_wake,
+            ),
+            _ => panic!("solve_linearized_integrated_forces requires Solver::Linearized"),
+        };
+
+        // Compute sectional forces and integrate per wing, extracting only the total.
+        let zero_acceleration = vec![SpatialVector::default(); self.line_force_model.nr_span_lines()];
+        let force_input = self.line_force_model.sectional_force_input(
+            &solver_result,
+            &zero_acceleration,
+        );
+        let sectional = self.line_force_model.sectional_forces(&force_input);
+
+        // Integrate per wing using wing_indices ranges.
+        let mut result = Vec::with_capacity(self.line_force_model.nr_wings());
+        for wing_range in &self.line_force_model.wing_indices {
+            let mut total = SpatialVector::default();
+            for i in wing_range.start..wing_range.end {
+                total += sectional.total[i];
+            }
+            result.push(total.0);
+        }
+        result
+    }
+
     /// Interface function to calculate the induced velocities from the wake at the given points.
     pub fn induced_velocities(
         &self,
