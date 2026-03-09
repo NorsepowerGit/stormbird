@@ -29,6 +29,7 @@ use rayon::prelude::*;
 
 use stormbird::lifting_line::simulation::Simulation as SimulationRust;
 use stormath::spatial_vector::SpatialVector;
+use stormath::optimize::particle_swarm::ParticleSwarm;
 
 // ─── small polynomial helper ─────────────────────────────────────────────────
 
@@ -284,10 +285,291 @@ pub fn compute_optimal_rpm_grid(
     Ok(results)
 }
 
+// ─── PSO-based optimal RPM computation ───────────────────────────────────────
+
+/// Compute the optimal RPM for every (SOG, AWA, AWS) condition using
+/// Particle Swarm Optimisation (PSO).
+///
+/// Unlike `compute_optimal_rpm_grid`, which requires an explicit pre-built
+/// grid of RPM combinations, this function searches the continuous RPM space
+/// directly. This makes it useful when the number of rotors or the RPM range
+/// is large enough that exhaustive enumeration becomes impractical.
+///
+/// Arguments
+/// ---------
+/// sim_json_string : str
+///     JSON produced by `SimulationBuilder.to_json_string()`.
+///
+/// conditions : list[tuple[float, float, float]]
+///     Each element is ``(sog_m_s, awa_deg, aws_m_s)``.
+///
+/// power_curve_coeffs : list[list[float]]
+///     Per-rotor polynomial coefficients in ascending-power order
+///     (numpy.polynomial.Polynomial convention).
+///
+/// rpm_min : float
+///     Lower bound of the RPM search space (applied to all rotors).
+///
+/// rpm_max : float
+///     Upper bound of the RPM search space (applied to all rotors).
+///
+/// fallback_rpm : float
+/// height_correction_factor : float
+/// lateral_force_limit : float       (kN, use f64::INFINITY to disable)
+/// resultant_force_limit : float     (kN, use f64::INFINITY to disable)
+/// rs_power_limit : float            (kW, use f64::INFINITY to disable)
+/// main_engine_efficiency : float
+/// minimum_savings : float           (kW)
+/// nr_particles : int
+///     Number of PSO particles (e.g. 30).
+/// nr_generations : int
+///     Number of PSO iterations (e.g. 100).
+/// n_workers : int
+///     Number of Rayon threads (≤ 1 means single-threaded).
+///
+/// Returns
+/// -------
+/// Same per-condition tuple format as `compute_optimal_rpm_grid`.
+#[pyfunction]
+#[pyo3(signature = (
+    sim_json_string,
+    conditions,
+    power_curve_coeffs,
+    rpm_min,
+    rpm_max,
+    fallback_rpm,
+    height_correction_factor,
+    lateral_force_limit,
+    resultant_force_limit,
+    rs_power_limit,
+    main_engine_efficiency,
+    minimum_savings,
+    nr_particles,
+    nr_generations,
+    n_workers,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_optimal_rpm_pso(
+    sim_json_string: String,
+    conditions: Vec<(f64, f64, f64)>,   // (sog, awa, aws)
+    power_curve_coeffs: Vec<Vec<f64>>,  // (n_rotors, n_coeffs)
+    rpm_min: f64,
+    rpm_max: f64,
+    fallback_rpm: f64,
+    height_correction_factor: f64,
+    lateral_force_limit: f64,
+    resultant_force_limit: f64,
+    rs_power_limit: f64,
+    main_engine_efficiency: f64,
+    minimum_savings: f64,
+    nr_particles: usize,
+    nr_generations: usize,
+    n_workers: usize,
+) -> PyResult<Vec<(
+    Vec<f64>,   // best_rpms
+    Vec<f64>,   // fwd_forces  (kN)
+    Vec<f64>,   // lat_forces  (kN)
+    f64,        // total_thrust
+    f64,        // total_power_generated
+    f64,        // total_power_required
+    f64,        // total_power_savings
+    Vec<f64>,   // per_rotor_power_generated
+    Vec<f64>,   // per_rotor_power_required
+    Vec<f64>,   // per_rotor_power_savings
+)>> {
+    let n_rotors = power_curve_coeffs.len();
+
+    if n_rotors == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "power_curve_coeffs is empty (no rotors)",
+        ));
+    }
+
+    let base_sim = SimulationRust::new_from_string(&sim_json_string)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:?}")))?;
+
+    let n_freestream_pts = base_sim.line_force_model.nr_span_lines();
+
+    let actual_workers = if n_workers < 1 { 1 } else { n_workers };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(actual_workers)
+        .build()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:?}")))?;
+
+    // Build the PSO configuration (same bounds for every rotor dimension).
+    let pso = ParticleSwarm {
+        nr_particles,
+        nr_dimensions: n_rotors,
+        expected_number_of_generations: nr_generations,
+        max_positions: vec![rpm_max; n_rotors],
+        min_positions: vec![rpm_min; n_rotors],
+        inertia_weight_max: 0.9,
+        inertia_weight_min: 0.4,
+        local_best_velocity_factor: 2.0,
+        global_best_velocity_factor: 2.0,
+    };
+
+    let results: Vec<_> = Python::attach(|py| {
+        py.detach(|| {
+            pool.install(|| {
+                conditions
+                    .par_iter()
+                    .map(|&(sog, awa, aws)| {
+                        let mut sim = base_sim.clone();
+                        let aws_corrected = aws * height_correction_factor;
+
+                        // ── Phase 1: build wake matrix once for this (AWA, AWS) ──
+                        let sb_wind_dir_rad = ((180.0 + awa) % 360.0).to_radians();
+                        let vx = aws_corrected * sb_wind_dir_rad.cos();
+                        let vy = aws_corrected * sb_wind_dir_rad.sin();
+                        let freestream: Vec<SpatialVector> =
+                            vec![SpatialVector::new(vx, vy, 0.0); n_freestream_pts];
+
+                        sim.prepare_quasi_steady_wake(&freestream);
+
+                        // ── PSO objective: negative total savings (minimise) ──
+                        // Infeasible combinations return +INFINITY.
+                        let mut evaluate = |rpms: &[f64]| -> f64 {
+                            let rev_per_s: Vec<f64> =
+                                rpms.iter().map(|&r| r / 60.0).collect();
+
+                            let forces = sim.solve_linearized_integrated_forces(
+                                &rev_per_s,
+                                &freestream,
+                            );
+
+                            let mut total_savings = 0.0f64;
+
+                            for r in 0..n_rotors {
+                                let fx = forces[r][0] / 1000.0; // N → kN
+                                let fy = forces[r][1] / 1000.0;
+                                let is_fallback = (rpms[r] - fallback_rpm).abs() < 1e-6;
+
+                                let res = (fx * fx + fy * fy).sqrt();
+                                let force_ok = is_fallback
+                                    || (fy.abs() <= lateral_force_limit
+                                        && res <= resultant_force_limit);
+
+                                let power_gen = fx * sog / main_engine_efficiency;
+                                let power_req =
+                                    eval_poly(&power_curve_coeffs[r], rpms[r].abs());
+                                let power_ok =
+                                    is_fallback || power_req <= rs_power_limit;
+                                let savings = power_gen - power_req;
+                                let savings_ok = is_fallback || savings >= minimum_savings;
+
+                                if !force_ok || !power_ok || !savings_ok {
+                                    return f64::INFINITY;
+                                }
+
+                                total_savings += savings;
+                            }
+
+                            // Minimise → return negative savings.
+                            -total_savings
+                        };
+
+                        // ── Run PSO ──────────────────────────────────────────────
+                        let mut state = pso.initial_state();
+                        let mut result = stormath::optimize::particle_swarm::SwarmResult::new(
+                            nr_particles,
+                            n_rotors,
+                        );
+
+                        for _ in 0..nr_generations {
+                            // Evaluate every particle.
+                            for p in 0..nr_particles {
+                                let pos: Vec<f64> = (0..n_rotors)
+                                    .map(|d| state.position[[p, d]])
+                                    .collect();
+                                let fval = evaluate(&pos);
+                                result.add_new_function_value(fval, p, &pos);
+                            }
+
+                            state = pso.next_state(&state, &result);
+                        }
+
+                        // ── Decode best position ─────────────────────────────────
+                        let best_rpms = result.global_best_position.clone();
+
+                        // Re-solve forces for the best RPM combination.
+                        let rev_per_s: Vec<f64> =
+                            best_rpms.iter().map(|&r| r / 60.0).collect();
+                        let forces =
+                            sim.solve_linearized_integrated_forces(&rev_per_s, &freestream);
+
+                        let mut best_fwd = vec![0.0f64; n_rotors];
+                        let mut best_lat = vec![0.0f64; n_rotors];
+                        let mut total_thrust = 0.0f64;
+                        let mut total_power_gen = 0.0f64;
+                        let mut total_power_req = 0.0f64;
+                        let mut per_rotor_power_gen = vec![0.0f64; n_rotors];
+                        let mut per_rotor_power_req = vec![0.0f64; n_rotors];
+                        let mut per_rotor_savings = vec![0.0f64; n_rotors];
+
+                        for r in 0..n_rotors {
+                            let fx = forces[r][0] / 1000.0;
+                            let fy = forces[r][1] / 1000.0;
+                            best_fwd[r] = fx;
+                            best_lat[r] = fy;
+
+                            let power_gen = fx * sog / main_engine_efficiency;
+                            let power_req =
+                                eval_poly(&power_curve_coeffs[r], best_rpms[r].abs());
+
+                            per_rotor_power_gen[r] = power_gen;
+                            per_rotor_power_req[r] = power_req;
+                            per_rotor_savings[r] = power_gen - power_req;
+
+                            total_thrust += fx;
+                            total_power_gen += power_gen;
+                            total_power_req += power_req;
+                        }
+
+                        // If the PSO found only infeasible solutions fall back to
+                        // the fallback RPM for all rotors.
+                        if result.global_best_function_value == f64::INFINITY {
+                            let fallback_rpms = vec![fallback_rpm; n_rotors];
+                            return (
+                                fallback_rpms,
+                                vec![0.0; n_rotors],
+                                vec![0.0; n_rotors],
+                                0.0f64,
+                                0.0f64,
+                                0.0f64,
+                                0.0f64,
+                                vec![0.0; n_rotors],
+                                vec![0.0; n_rotors],
+                                vec![0.0; n_rotors],
+                            );
+                        }
+
+                        (
+                            best_rpms,
+                            best_fwd,
+                            best_lat,
+                            total_thrust,
+                            total_power_gen,
+                            total_power_req,
+                            total_power_gen - total_power_req,
+                            per_rotor_power_gen,
+                            per_rotor_power_req,
+                            per_rotor_savings,
+                        )
+                    })
+                    .collect()
+            })
+        })
+    });
+
+    Ok(results)
+}
+
 // ─── submodule registration ───────────────────────────────────────────────────
 
 #[pymodule]
 pub fn optimal_rpm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_optimal_rpm_grid, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_optimal_rpm_pso, m)?)?;
     Ok(())
 }
