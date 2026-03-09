@@ -546,36 +546,31 @@ pub fn compute_optimal_rpm_pso(
                         }
 
                         // Fall back to fallback RPM only if the best found solution
-                        // would produce negative total savings (i.e. it is actively
-                        // harmful) or violates a hard physical constraint (force/power
-                        // limits).  Per-rotor minimum-savings is an optimisation target
-                        // already handled by the penalty in the objective; enforcing it
-                        // as a hard post-hoc gate causes good solutions to be discarded
-                        // when the PSO converges to a near-feasible point where one
-                        // rotor is marginally below threshold.
+                        // violates a hard physical constraint (force/power limits).
+                        // Negative total savings are intentionally preserved so that
+                        // the PSO output matches the grid-search behaviour: headwind
+                        // conditions genuinely produce negative savings and suppressing
+                        // them would hide real physics from the caller.
                         let best_is_acceptable = {
-                            let total_sav = total_power_gen - total_power_req;
-                            let mut force_power_ok = total_sav > 0.0;
-                            if force_power_ok {
-                                let rev_check: Vec<f64> =
-                                    best_rpms.iter().map(|&r| r / 60.0).collect();
-                                let f_check =
-                                    sim.solve_linearized_integrated_forces(&rev_check, &freestream);
-                                for r in 0..n_rotors {
-                                    let fx = f_check[r][0] / 1000.0;
-                                    let fy = f_check[r][1] / 1000.0;
-                                    let is_fallback = (best_rpms[r] - fallback_rpm).abs() < 1e-6;
-                                    let res = (fx * fx + fy * fy).sqrt();
-                                    let force_ok = is_fallback
-                                        || (fy.abs() <= lateral_force_limit
-                                            && res <= resultant_force_limit);
-                                    let power_req =
-                                        eval_poly(&power_curve_coeffs[r], best_rpms[r].abs());
-                                    let power_ok = is_fallback || power_req <= rs_power_limit;
-                                    if !force_ok || !power_ok {
-                                        force_power_ok = false;
-                                        break;
-                                    }
+                            let mut force_power_ok = true;
+                            let rev_check: Vec<f64> =
+                                best_rpms.iter().map(|&r| r / 60.0).collect();
+                            let f_check =
+                                sim.solve_linearized_integrated_forces(&rev_check, &freestream);
+                            for r in 0..n_rotors {
+                                let fx = f_check[r][0] / 1000.0;
+                                let fy = f_check[r][1] / 1000.0;
+                                let is_fallback = (best_rpms[r] - fallback_rpm).abs() < 1e-6;
+                                let res = (fx * fx + fy * fy).sqrt();
+                                let force_ok = is_fallback
+                                    || (fy.abs() <= lateral_force_limit
+                                        && res <= resultant_force_limit);
+                                let power_req =
+                                    eval_poly(&power_curve_coeffs[r], best_rpms[r].abs());
+                                let power_ok = is_fallback || power_req <= rs_power_limit;
+                                if !force_ok || !power_ok {
+                                    force_power_ok = false;
+                                    break;
                                 }
                             }
                             force_power_ok
