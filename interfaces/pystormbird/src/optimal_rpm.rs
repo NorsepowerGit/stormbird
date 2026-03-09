@@ -428,7 +428,23 @@ pub fn compute_optimal_rpm_pso(
                         sim.prepare_quasi_steady_wake(&freestream);
 
                         // ── PSO objective: negative total savings (minimise) ──
-                        // Infeasible combinations return +INFINITY.
+                        //
+                        // Hard feasibility boundaries create a discontinuous landscape
+                        // that traps PSO particles in infeasible regions.  Instead we
+                        // use a penalty-based approach:
+                        //
+                        //   objective = -(total_savings) + penalty
+                        //
+                        // where `penalty` is a large positive value proportional to the
+                        // sum of constraint violations.  This keeps the landscape
+                        // continuous so particles can follow the gradient across
+                        // feasibility boundaries.  Force/power-limit violations and
+                        // per-rotor savings-below-minimum are all penalised.
+                        //
+                        // The penalty weight is chosen so that even a tiny constraint
+                        // violation dominates any feasible savings gain.
+                        const PENALTY_WEIGHT: f64 = 1_000.0;
+
                         let mut evaluate = |rpms: &[f64]| -> f64 {
                             let rev_per_s: Vec<f64> =
                                 rpms.iter().map(|&r| r / 60.0).collect();
@@ -439,34 +455,37 @@ pub fn compute_optimal_rpm_pso(
                             );
 
                             let mut total_savings = 0.0f64;
+                            let mut penalty = 0.0f64;
 
                             for r in 0..n_rotors {
                                 let fx = forces[r][0] / 1000.0; // N → kN
                                 let fy = forces[r][1] / 1000.0;
                                 let is_fallback = (rpms[r] - fallback_rpm).abs() < 1e-6;
 
+                                // Lateral force violation
+                                let lat_viol = if is_fallback { 0.0 } else { (fy.abs() - lateral_force_limit).max(0.0) };
+                                // Resultant force violation
                                 let res = (fx * fx + fy * fy).sqrt();
-                                let force_ok = is_fallback
-                                    || (fy.abs() <= lateral_force_limit
-                                        && res <= resultant_force_limit);
+                                let res_viol = if is_fallback { 0.0 } else { (res - resultant_force_limit).max(0.0) };
 
                                 let power_gen = fx * sog / main_engine_efficiency;
                                 let power_req =
                                     eval_poly(&power_curve_coeffs[r], rpms[r].abs());
-                                let power_ok =
-                                    is_fallback || power_req <= rs_power_limit;
+
+                                // Power limit violation
+                                let power_viol = if is_fallback { 0.0 } else { (power_req - rs_power_limit).max(0.0) };
+
                                 let savings = power_gen - power_req;
-                                let savings_ok = is_fallback || savings >= minimum_savings;
 
-                                if !force_ok || !power_ok || !savings_ok {
-                                    return f64::INFINITY;
-                                }
+                                // Per-rotor minimum-savings violation
+                                let sav_viol = if is_fallback { 0.0 } else { (minimum_savings - savings).max(0.0) };
 
+                                penalty += PENALTY_WEIGHT * (lat_viol + res_viol + power_viol + sav_viol);
                                 total_savings += savings;
                             }
 
-                            // Minimise → return negative savings.
-                            -total_savings
+                            // Minimise → return negative savings plus penalty.
+                            -total_savings + penalty
                         };
 
                         // ── Run PSO ──────────────────────────────────────────────
@@ -526,9 +545,43 @@ pub fn compute_optimal_rpm_pso(
                             total_power_req += power_req;
                         }
 
-                        // If the PSO found only infeasible solutions fall back to
-                        // the fallback RPM for all rotors.
-                        if result.global_best_function_value == f64::INFINITY {
+                        // Fall back to fallback RPM only if the best found solution
+                        // would produce negative total savings (i.e. it is actively
+                        // harmful) or violates a hard physical constraint (force/power
+                        // limits).  Per-rotor minimum-savings is an optimisation target
+                        // already handled by the penalty in the objective; enforcing it
+                        // as a hard post-hoc gate causes good solutions to be discarded
+                        // when the PSO converges to a near-feasible point where one
+                        // rotor is marginally below threshold.
+                        let best_is_acceptable = {
+                            let total_sav = total_power_gen - total_power_req;
+                            let mut force_power_ok = total_sav > 0.0;
+                            if force_power_ok {
+                                let rev_check: Vec<f64> =
+                                    best_rpms.iter().map(|&r| r / 60.0).collect();
+                                let f_check =
+                                    sim.solve_linearized_integrated_forces(&rev_check, &freestream);
+                                for r in 0..n_rotors {
+                                    let fx = f_check[r][0] / 1000.0;
+                                    let fy = f_check[r][1] / 1000.0;
+                                    let is_fallback = (best_rpms[r] - fallback_rpm).abs() < 1e-6;
+                                    let res = (fx * fx + fy * fy).sqrt();
+                                    let force_ok = is_fallback
+                                        || (fy.abs() <= lateral_force_limit
+                                            && res <= resultant_force_limit);
+                                    let power_req =
+                                        eval_poly(&power_curve_coeffs[r], best_rpms[r].abs());
+                                    let power_ok = is_fallback || power_req <= rs_power_limit;
+                                    if !force_ok || !power_ok {
+                                        force_power_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            force_power_ok
+                        };
+
+                        if !best_is_acceptable {
                             let fallback_rpms = vec![fallback_rpm; n_rotors];
                             return (
                                 fallback_rpms,

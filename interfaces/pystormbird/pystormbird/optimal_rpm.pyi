@@ -27,8 +27,8 @@ def compute_optimal_rpm_grid(
 
 
 def compute_optimal_rpm_pso(
-    sim_json_string: str,
     conditions: list[tuple[float, float, float]],
+    sim_json_string: str,
     power_curve_coeffs: list[list[float]],
     rpm_min: float,
     rpm_max: float,
